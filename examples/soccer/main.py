@@ -1,6 +1,7 @@
 import argparse
+import json  # Import the json module
 from enum import Enum
-from typing import Iterator, List
+from typing import Iterator, List, Dict, Any
 
 import os
 import cv2
@@ -14,6 +15,7 @@ from sports.common.ball import BallTracker, BallAnnotator
 from sports.common.team import TeamClassifier
 from sports.common.view import ViewTransformer
 from sports.configs.soccer import SoccerPitchConfiguration
+
 
 PARENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLAYER_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/football-player-detection.pt')
@@ -323,7 +325,46 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         yield annotated_frame
 
 
-def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+def convert_numpy_types(data: Any) -> Any:
+    """
+    Recursively convert numpy types in data (dict, list, etc.) to native Python types.
+
+    Args:
+        data (Any): Input data that may contain numpy types.
+
+    Returns:
+        Any: Data with numpy types converted to Python native types.
+    """
+    if isinstance(data, np.ndarray):
+        return data.tolist()  # Convert numpy arrays to lists
+    elif isinstance(data, np.generic):  # Handle numpy scalar types
+        return data.item()
+    elif isinstance(data, dict):
+        return {key: convert_numpy_types(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [convert_numpy_types(item) for item in data]
+    return data  # Return native types as is
+
+
+all_frames = []
+
+
+def save_all_frames_to_json(json_file_path: str) -> None:
+    """
+    Save all collected frames to a JSON file with a root object.
+
+    Args:
+        json_file_path (str): Path to the output JSON file.
+    """
+    # Convert all numpy types in the frames data to native Python types
+    converted_frames = convert_numpy_types(all_frames)
+
+    # Now save the converted data to the JSON file
+    with open(json_file_path, 'w') as json_file:
+        json.dump({"frames": converted_frames}, json_file, indent=4)
+
+
+def run_radar(source_video_path: str, device: str, json_file_path: str) -> Iterator[np.ndarray]:
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
     frame_generator = sv.get_video_frames_generator(
@@ -340,9 +381,19 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+
+    frame_index = 0  # To keep track of the frame number
     for frame in frame_generator:
         result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
+
+        # Create a ViewTransformer for this frame using the keypoints
+        mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
+        transformer = ViewTransformer(
+            source=keypoints.xy[0][mask].astype(np.float32),
+            target=np.array(CONFIG.vertices)[mask].astype(np.float32)
+        )
+
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = tracker.update_with_detections(detections)
@@ -365,6 +416,23 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         )
         labels = [str(tracker_id) for tracker_id in detections.tracker_id]
 
+        # Apply homography transformation to player, goalkeeper, and referee positions
+        transformed_players_positions = transformer.transform_points(players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)) / 100  # Convert cm to m
+        transformed_goalkeepers_positions = transformer.transform_points(goalkeepers.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)) / 100  # Convert cm to m
+        transformed_referees_positions = transformer.transform_points(referees.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)) / 100  # Convert cm to m
+
+        # Save transformed (and scaled) positions to JSON
+        frame_data = {
+            'frame_index': frame_index,
+            'players': [{'id': int(tracker_id), 'team_id': int(team_id), 'position': list(pos)}
+                        for tracker_id, team_id, pos in zip(detections.tracker_id, players_team_id, transformed_players_positions)],
+            'goalkeepers': [{'id': int(tracker_id), 'team_id': int(team_id), 'position': list(pos)}
+                            for tracker_id, team_id, pos in zip(detections.tracker_id, goalkeepers_team_id, transformed_goalkeepers_positions)],
+            'referees': [{'position': list(pos)} for pos in transformed_referees_positions]
+        }
+
+        all_frames.append(frame_data)
+
         annotated_frame = frame.copy()
         annotated_frame = ELLIPSE_ANNOTATOR.annotate(
             annotated_frame, detections, custom_color_lookup=color_lookup)
@@ -383,10 +451,13 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
             height=radar_h
         )
         annotated_frame = sv.draw_image(annotated_frame, radar, opacity=0.5, rect=rect)
+
+        frame_index += 1
         yield annotated_frame
+    save_all_frames_to_json(json_file_path)
 
 
-def main(source_video_path: str, target_video_path: str, device: str, mode: Mode) -> None:
+def main(source_video_path: str, target_video_path: str, device: str, mode: Mode, json_file_path: str) -> None:
     if mode == Mode.PITCH_DETECTION:
         frame_generator = run_pitch_detection(
             source_video_path=source_video_path, device=device)
@@ -404,7 +475,7 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
             source_video_path=source_video_path, device=device)
     elif mode == Mode.RADAR:
         frame_generator = run_radar(
-            source_video_path=source_video_path, device=device)
+            source_video_path=source_video_path, device=device, json_file_path=json_file_path)
     else:
         raise NotImplementedError(f"Mode {mode} is not implemented.")
 
@@ -413,8 +484,8 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
         for frame in frame_generator:
             sink.write_frame(frame)
 
-            cv2.imshow("frame", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            cv2.imshow('frame', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
         cv2.destroyAllWindows()
 
@@ -425,10 +496,12 @@ if __name__ == '__main__':
     parser.add_argument('--target_video_path', type=str, required=True)
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--mode', type=Mode, default=Mode.PLAYER_DETECTION)
+    parser.add_argument('--json_file_path', type=str, default='output.json')
     args = parser.parse_args()
     main(
         source_video_path=args.source_video_path,
         target_video_path=args.target_video_path,
         device=args.device,
-        mode=args.mode
+        mode=args.mode,
+        json_file_path=args.json_file_path  # Pass JSON file path to the main function
     )

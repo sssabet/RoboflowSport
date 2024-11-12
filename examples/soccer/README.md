@@ -103,9 +103,9 @@ soccer field. Provides a comprehensive overview of player movements and team for
 on the field.
 
   ```bash
-  python main.py --source_video_path data/2e57b9_0.mp4 \
-  --target_video_path data/2e57b9_0-radar.mp4 \
-  --device mps --mode RADAR
+  python main.py --source_video_path data/0bfacc_10.mp4 \
+  --target_video_path data/0bfacc_10radar.mp4 \
+  --device cpu --mode RADAR --json_file_path data/0bfacc_10.json
   ```
 
   https://github.com/user-attachments/assets/263b4cd0-2185-4ed3-9be2-cf4d8f5bfa67
