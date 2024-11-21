@@ -1,5 +1,5 @@
 import argparse
-import json  # Import the json module
+import json
 from enum import Enum
 from typing import Iterator, List, Dict, Any
 
@@ -20,17 +20,18 @@ from sports.configs.soccer import SoccerPitchConfiguration
 PARENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLAYER_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/football-player-detection.pt')
 PITCH_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/football-pitch-detection.pt')
-BALL_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/football-ball-detection.pt')
+BALL_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/football-ball-detection-v2.pt')
 
 BALL_CLASS_ID = 0
 GOALKEEPER_CLASS_ID = 1
 PLAYER_CLASS_ID = 2
 REFEREE_CLASS_ID = 3
+BALL_COLOR_ID = 4
 
 STRIDE = 60
 CONFIG = SoccerPitchConfiguration()
 
-COLORS = ['#FF1493', '#00BFFF', '#FF6347', '#FFD700']
+COLORS = ['#FF1493', '#00BFFF', '#FF6347', '#FFD700', '#FFFFFF']
 VERTEX_LABEL_ANNOTATOR = sv.VertexLabelAnnotator(
     color=[sv.Color.from_hex(color) for color in CONFIG.colors],
     text_color=sv.Color.from_hex('#FFFFFF'),
@@ -157,6 +158,9 @@ def render_radar(
     radar = draw_points_on_pitch(
         config=CONFIG, xy=transformed_xy[color_lookup == 3],
         face_color=sv.Color.from_hex(COLORS[3]), radius=20, pitch=radar)
+    radar = draw_points_on_pitch(
+        config=CONFIG, xy=transformed_xy[color_lookup == 4],
+        face_color=sv.Color.from_hex(COLORS[4]), radius=20, pitch=radar)
     return radar
 
 
@@ -228,8 +232,9 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
 
     slicer = sv.InferenceSlicer(
         callback=callback,
-        overlap_filter_strategy=sv.OverlapFilter.NONE,
         slice_wh=(640, 640),
+        overlap_ratio_wh=None,
+        overlap_wh=(0, 0)
     )
 
     for frame in frame_generator:
@@ -367,6 +372,8 @@ def save_all_frames_to_json(json_file_path: str) -> None:
 def run_radar(source_video_path: str, device: str, json_file_path: str) -> Iterator[np.ndarray]:
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
+    ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
+    ball_tracker = BallTracker(buffer_size=20)
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=STRIDE)
 
@@ -408,11 +415,22 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
 
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
-        detections = sv.Detections.merge([players, goalkeepers, referees])
+        ball_result = ball_detection_model(frame, imgsz=640, verbose=False)[0]
+        ball_detections = sv.Detections.from_ultralytics(ball_result)
+        ball_class_id = 1
+        ball_detections = ball_detections[ball_detections.class_id == ball_class_id]
+
+        ball_detections = ball_tracker.update(ball_detections)
+        # Assign dummy tracker_id to ball_detections if they don't have any
+        if ball_detections.tracker_id is None:
+            ball_detections.tracker_id = np.arange(len(ball_detections))
+
+        detections = sv.Detections.merge([players, goalkeepers, referees, ball_detections])
         color_lookup = np.array(
             players_team_id.tolist() +
             goalkeepers_team_id.tolist() +
-            [REFEREE_CLASS_ID] * len(referees)
+            [REFEREE_CLASS_ID] * len(referees) +
+            [BALL_COLOR_ID] * len(ball_detections)
         )
         labels = [str(tracker_id) for tracker_id in detections.tracker_id]
 
@@ -421,14 +439,17 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
         transformed_goalkeepers_positions = transformer.transform_points(goalkeepers.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)) / 100  # Convert cm to m
         transformed_referees_positions = transformer.transform_points(referees.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)) / 100  # Convert cm to m
 
+        transformed_ball_positions = transformer.transform_points(
+            ball_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER))
         # Save transformed (and scaled) positions to JSON
         frame_data = {
             'frame_index': frame_index,
             'players': [{'id': int(tracker_id), 'team_id': int(team_id), 'position': list(pos)}
-                        for tracker_id, team_id, pos in zip(detections.tracker_id, players_team_id, transformed_players_positions)],
+                        for tracker_id, team_id, pos in zip(players.tracker_id, players_team_id, transformed_players_positions)],
             'goalkeepers': [{'id': int(tracker_id), 'team_id': int(team_id), 'position': list(pos)}
-                            for tracker_id, team_id, pos in zip(detections.tracker_id, goalkeepers_team_id, transformed_goalkeepers_positions)],
-            'referees': [{'position': list(pos)} for pos in transformed_referees_positions]
+                            for tracker_id, team_id, pos in zip(goalkeepers.tracker_id, goalkeepers_team_id, transformed_goalkeepers_positions)],
+            'referees': [{'position': list(pos)} for pos in transformed_referees_positions],
+            'balls': [{'position': list(pos)} for pos in transformed_ball_positions / 100]  # Convert cm to m
         }
 
         all_frames.append(frame_data)
