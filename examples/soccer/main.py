@@ -2,6 +2,7 @@ import argparse
 import json
 from enum import Enum
 from typing import Iterator, List, Dict, Any
+from collections import defaultdict
 
 import os
 import cv2
@@ -10,12 +11,12 @@ import supervision as sv
 from tqdm import tqdm
 from ultralytics import YOLO
 
-from sports.annotators.soccer import draw_pitch, draw_points_on_pitch
+from sports.annotators.soccer import draw_pitch, draw_points_with_labels_on_pitch
 from sports.common.ball import BallTracker, BallAnnotator
 from sports.common.team import TeamClassifier
 from sports.common.view import ViewTransformer
 from sports.configs.soccer import SoccerPitchConfiguration
-
+from pytesseract import pytesseract
 
 PARENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLAYER_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/football-player-detection.pt')
@@ -82,6 +83,7 @@ class Mode(Enum):
     BALL_DETECTION = 'BALL_DETECTION'
     PLAYER_TRACKING = 'PLAYER_TRACKING'
     TEAM_CLASSIFICATION = 'TEAM_CLASSIFICATION'
+    JERSEY_DETECTION = 'JERSEY_DETECTION'
     RADAR = 'RADAR'
 
 
@@ -135,7 +137,8 @@ def resolve_goalkeepers_team_id(
 def render_radar(
     detections: sv.Detections,
     keypoints: sv.KeyPoints,
-    color_lookup: np.ndarray
+    color_lookup: np.ndarray,
+    labels: List[str] = None
 ) -> np.ndarray:
     mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
     transformer = ViewTransformer(
@@ -146,21 +149,21 @@ def render_radar(
     transformed_xy = transformer.transform_points(points=xy)
 
     radar = draw_pitch(config=CONFIG)
-    radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 0],
-        face_color=sv.Color.from_hex(COLORS[0]), radius=20, pitch=radar)
-    radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 1],
-        face_color=sv.Color.from_hex(COLORS[1]), radius=20, pitch=radar)
-    radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 2],
-        face_color=sv.Color.from_hex(COLORS[2]), radius=20, pitch=radar)
-    radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 3],
-        face_color=sv.Color.from_hex(COLORS[3]), radius=20, pitch=radar)
-    radar = draw_points_on_pitch(
-        config=CONFIG, xy=transformed_xy[color_lookup == 4],
-        face_color=sv.Color.from_hex(COLORS[4]), radius=20, pitch=radar)
+
+    # Filter points and labels by team/color and draw
+    for color_id in range(5):  # 5 possible colors
+        team_mask = (color_lookup == color_id)
+        team_xy = transformed_xy[team_mask]
+        team_labels = [labels[i] for i in range(len(labels)) if team_mask[i]] if labels else None
+        radar = draw_points_with_labels_on_pitch(
+            config=CONFIG,
+            xy=team_xy,
+            face_color=sv.Color.from_hex(COLORS[color_id]),
+            radius=2 if color_id == 5 else 20,
+            pitch=radar,
+            labels=team_labels
+        )
+
     return radar
 
 
@@ -330,6 +333,103 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         yield annotated_frame
 
 
+def run_jersey_detection(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+    """
+    Run jersey number recognition with team classification, ensuring unique numbers per team.
+
+    Args:
+        source_video_path (str): Path to the source video.
+        device (str): Device to run the model on.
+
+    Yields:
+        Iterator[np.ndarray]: Iterator over annotated frames.
+    """
+    player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
+    team_classifier = TeamClassifier(device=device)
+
+    # First, collect crops to fit the team classifier
+    frame_generator = sv.get_video_frames_generator(
+        source_path=source_video_path, stride=STRIDE)
+    crops = []
+    for frame in tqdm(frame_generator, desc='collecting crops'):
+        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(result)
+        player_detections = detections[detections.class_id == PLAYER_CLASS_ID]
+        crops += get_crops(frame, player_detections)
+
+    team_classifier.fit(crops)
+
+    # Now process frames
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+
+    # Initialize jersey number history and assigned numbers per team
+    jersey_numbers_history = defaultdict(lambda: defaultdict(int))  # {tracker_id: {jersey_number: count}}
+    assigned_jersey_numbers = defaultdict(dict)  # {team_id: {tracker_id: jersey_number}}
+
+    JERSEY_NUMBER_THRESHOLD = 5  # Number of times the same jersey number must be observed
+
+    for frame in frame_generator:
+        # Detect players
+        player_result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        player_detections = sv.Detections.from_ultralytics(player_result)
+        player_detections = tracker.update_with_detections(player_detections)
+
+        # Get player crops
+        players = player_detections[player_detections.class_id == PLAYER_CLASS_ID]
+        player_crops = get_crops(frame, players)
+
+        # Classify teams
+        players_team_id = team_classifier.predict(player_crops)
+
+        labels = []
+        for tracker_id, team_id, crop in zip(players.tracker_id, players_team_id, player_crops):
+            # Preprocess the crop to improve OCR accuracy
+            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            # Apply thresholding to isolate the numbers
+            _, thresh_crop = cv2.threshold(
+                gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+
+            # Use OCR to read the jersey number
+            jersey_number = pytesseract.image_to_string(
+                thresh_crop,
+                config='--psm 7 -c tessedit_char_whitelist=0123456789'
+            ).strip()
+
+            # Update jersey_numbers_history
+            counts = jersey_numbers_history[tracker_id]
+            counts[jersey_number] += 1
+
+            # Decide whether to assign jersey number
+            assigned_jersey_number = None
+            # Check if any jersey number has reached the threshold
+            for number, count in counts.items():
+                if count >= JERSEY_NUMBER_THRESHOLD and number.isdigit():
+                    # Check if the jersey number is already assigned to another player in the same team
+                    team_numbers = assigned_jersey_numbers[team_id]
+                    if number not in team_numbers.values():
+                        assigned_jersey_numbers[team_id][tracker_id] = number
+                        assigned_jersey_number = number
+                        break  # Exit loop once the jersey number is confirmed
+
+            # Build label
+            if tracker_id in assigned_jersey_numbers[team_id]:
+                label = assigned_jersey_numbers[team_id][tracker_id]
+            else:
+                label = ""
+
+            labels.append(label)
+
+        # Annotate frames
+        annotated_frame = frame.copy()
+        annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, players)
+        annotated_frame = BOX_LABEL_ANNOTATOR.annotate(
+            annotated_frame, players, labels=labels
+        )
+        yield annotated_frame
+
+
 def convert_numpy_types(data: Any) -> Any:
     """
     Recursively convert numpy types in data (dict, list, etc.) to native Python types.
@@ -386,6 +486,11 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
     team_classifier = TeamClassifier(device=device)
     team_classifier.fit(crops)
 
+    # Initialize jersey number history and assigned numbers per team
+    jersey_numbers_history = defaultdict(lambda: defaultdict(int))
+    assigned_jersey_numbers = defaultdict(dict) 
+    JERSEY_NUMBER_THRESHOLD = 3  # Number of times the same jersey number must be observed
+
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
 
@@ -408,6 +513,46 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
         players = detections[detections.class_id == PLAYER_CLASS_ID]
         crops = get_crops(frame, players)
         players_team_id = team_classifier.predict(crops)
+
+        # Perform jersey number recognition and assignment
+        player_crops = get_crops(frame, players)
+        labels = []
+        for tracker_id, team_id, crop in zip(players.tracker_id, players_team_id, player_crops):
+            # Preprocess the crop to improve OCR accuracy
+            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            # Apply thresholding to isolate the numbers
+            _, thresh_crop = cv2.threshold(
+                gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+
+            # Use OCR to read the jersey number
+            jersey_number = pytesseract.image_to_string(
+                thresh_crop,
+                config='--psm 7 -c tessedit_char_whitelist=0123456789'
+            ).strip()
+
+            # Update jersey_numbers_history
+            counts = jersey_numbers_history[tracker_id]
+            counts[jersey_number] += 1
+
+            # Decide whether to assign jersey number
+            assigned_jersey_number = None
+            # Check if any jersey number has reached the threshold
+            for number, count in counts.items():
+                if count >= JERSEY_NUMBER_THRESHOLD and number.isdigit():
+                    # Check if the jersey number is already assigned to another player in the same team
+                    team_numbers = assigned_jersey_numbers[team_id]
+                    if number not in team_numbers.values():
+                        assigned_jersey_numbers[team_id][tracker_id] = number
+                        break  # Exit loop once the jersey number is confirmed
+
+            # Build label
+            if tracker_id in assigned_jersey_numbers[team_id]:
+                label = assigned_jersey_numbers[team_id][tracker_id]
+            else:
+                label = ""  # No jersey number assigned yet
+
+            labels.append(label)
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
@@ -432,7 +577,8 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
             [REFEREE_CLASS_ID] * len(referees) +
             [BALL_COLOR_ID] * len(ball_detections)
         )
-        labels = [str(tracker_id) for tracker_id in detections.tracker_id]
+        # Build full labels for annotation
+        labels = labels + [""] * (len(goalkeepers) + len(referees) + len(ball_detections))
 
         # Apply homography transformation to player, goalkeeper, and referee positions
         transformed_players_positions = transformer.transform_points(players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)) / 100  # Convert cm to m
@@ -444,9 +590,9 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
         # Save transformed (and scaled) positions to JSON
         frame_data = {
             'frame_index': frame_index,
-            'players': [{'id': int(tracker_id), 'team_id': int(team_id), 'position': list(pos)}
+            'players': [{'id': int(tracker_id), 'team_id': int(team_id), 'position': list(pos), 'jersey_number': assigned_jersey_numbers[team_id].get(tracker_id, None)}
                         for tracker_id, team_id, pos in zip(players.tracker_id, players_team_id, transformed_players_positions)],
-            'goalkeepers': [{'id': int(tracker_id), 'team_id': int(team_id), 'position': list(pos)}
+            'goalkeepers': [{'id': int(tracker_id), 'team_id': int(team_id), 'position': list(pos), 'jersey_number': '1'}
                             for tracker_id, team_id, pos in zip(goalkeepers.tracker_id, goalkeepers_team_id, transformed_goalkeepers_positions)],
             'referees': [{'position': list(pos)} for pos in transformed_referees_positions],
             'balls': [{'position': list(pos)} for pos in transformed_ball_positions / 100]  # Convert cm to m
@@ -462,7 +608,7 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
             custom_color_lookup=color_lookup)
 
         h, w, _ = frame.shape
-        radar = render_radar(detections, keypoints, color_lookup)
+        radar = render_radar(detections, keypoints, color_lookup, labels)
         radar = sv.resize_image(radar, (w // 2, h // 2))
         radar_h, radar_w, _ = radar.shape
         rect = sv.Rect(
@@ -493,6 +639,9 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
             source_video_path=source_video_path, device=device)
     elif mode == Mode.TEAM_CLASSIFICATION:
         frame_generator = run_team_classification(
+            source_video_path=source_video_path, device=device)
+    elif mode == Mode.JERSEY_DETECTION:
+        frame_generator = run_jersey_detection(
             source_video_path=source_video_path, device=device)
     elif mode == Mode.RADAR:
         frame_generator = run_radar(
