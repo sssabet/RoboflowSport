@@ -495,6 +495,11 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
 
     frame_index = 0  # To keep track of the frame number
+
+    # Initialize last_ball_detections to store the last known ball positions
+    last_ball_detections = None
+    ball_missing_frames = 0
+    BALL_MISSING_THRESHOLD = 15
     for frame in frame_generator:
         result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
@@ -535,8 +540,6 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
             counts = jersey_numbers_history[tracker_id]
             counts[jersey_number] += 1
 
-            # Decide whether to assign jersey number
-            assigned_jersey_number = None
             # Check if any jersey number has reached the threshold
             for number, count in counts.items():
                 if count >= JERSEY_NUMBER_THRESHOLD and number.isdigit():
@@ -566,6 +569,18 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
         ball_detections = ball_detections[ball_detections.class_id == ball_class_id]
 
         ball_detections = ball_tracker.update(ball_detections)
+
+        if len(ball_detections) == 0:
+            if last_ball_detections is not None and ball_missing_frames < BALL_MISSING_THRESHOLD:
+                ball_detections = last_ball_detections
+                ball_missing_frames += 1
+            else:
+                last_ball_detections = None
+                ball_missing_frames = 0
+        else:
+            last_ball_detections = ball_detections
+            ball_missing_frames = 0
+
         # Assign dummy tracker_id to ball_detections if they don't have any
         if ball_detections.tracker_id is None:
             ball_detections.tracker_id = np.arange(len(ball_detections))
