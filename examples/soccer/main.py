@@ -469,14 +469,86 @@ def save_all_frames_to_json(json_file_path: str) -> None:
         json.dump({"frames": converted_frames}, json_file, indent=4)
 
 
+def estimate_speed(position_history, frame_rate):
+    """
+    Estimate the speed of a player given their position history.
+    :param position_history: List of (x, y) positions.
+    :param frame_rate: Frame rate of the video (frames per second).
+    :return: Speed in meters per second (m/s).
+    """
+    if len(position_history) < 2:
+        return 0.0  # Not enough data to calculate speed
+
+    # Calculate distance between the last two positions
+    delta_x = position_history[-1][0] - position_history[-2][0]
+    delta_y = position_history[-1][1] - position_history[-2][1]
+    distance = np.sqrt(delta_x**2 + delta_y**2)
+
+    # Time between two frames
+    time = 1 / frame_rate
+
+    # Speed = distance / time
+    speed = distance / time
+    return speed
+
+# Constants for team identification
+TEAM_A_ID = 0
+TEAM_B_ID = 1
+
+# Initialize counters for possession
+possession_counts = {
+    TEAM_A_ID: 0,
+    TEAM_B_ID: 0
+}
+total_frames = 0
+
+
+# Helper function to compute Euclidean distance
+def euclidean_distance(pt1: np.ndarray, pt2: np.ndarray) -> float:
+    return np.sqrt((pt1[0] - pt2[0])**2 + (pt1[1] - pt2[1])**2)
+
+
+def create_radar_frame(frame: np.ndarray,
+                       detections: sv.Detections,
+                       color_lookup: np.ndarray,
+                       labels: list,
+                       keypoints: sv.KeyPoints) -> np.ndarray:
+    '''
+    A helper function that:
+      1. Renders the radar using your existing logic (e.g., `render_radar`)
+      2. Resizes it
+      3. Overlays it onto the current frame
+    '''
+
+    h, w, _ = frame.shape
+    # Render your radar using existing logic
+    radar = render_radar(detections, keypoints, color_lookup, labels)
+    radar = sv.resize_image(radar, (w // 2, h // 2))
+
+    radar_h, radar_w, _ = radar.shape
+    rect = sv.Rect(
+        x=w // 2 - radar_w // 2,
+        y=h - radar_h,
+        width=radar_w,
+        height=radar_h
+    )
+
+    # Overlay radar with some opacity
+    annotated_frame = sv.draw_image(frame, radar, opacity=0.5, rect=rect)
+
+    return annotated_frame
+
+
 def run_radar(source_video_path: str, device: str, json_file_path: str) -> Iterator[np.ndarray]:
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
     ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
     ball_tracker = BallTracker(buffer_size=20)
     frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=STRIDE)
+        source_path=source_video_path, stride=STRIDE
+    )
 
+    # Collect crops for team classification
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
@@ -488,9 +560,14 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
 
     # Initialize jersey number history and assigned numbers per team
     jersey_numbers_history = defaultdict(lambda: defaultdict(int))
-    assigned_jersey_numbers = defaultdict(dict) 
+    assigned_jersey_numbers = defaultdict(dict)
     JERSEY_NUMBER_THRESHOLD = 3  # Number of times the same jersey number must be observed
 
+    # Initialize position history for speed calculation
+    position_history = defaultdict(list)
+    frame_rate = 30  # Assuming a default frame rate (update if known)
+
+    # Start a new frame generator without the stride for actual processing
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
 
@@ -500,7 +577,12 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
     last_ball_detections = None
     ball_missing_frames = 0
     BALL_MISSING_THRESHOLD = 15
+
+    # We'll store output data here
+    all_frames = []
+
     for frame in frame_generator:
+        # ------------------- Pitch Detection -------------------
         result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
 
@@ -511,6 +593,7 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
             target=np.array(CONFIG.vertices)[mask].astype(np.float32)
         )
 
+        # ------------------- Player Detection & Tracking -------------------
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = tracker.update_with_detections(detections)
@@ -519,55 +602,72 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
         crops = get_crops(frame, players)
         players_team_id = team_classifier.predict(crops)
 
-        # Perform jersey number recognition and assignment
-        player_crops = get_crops(frame, players)
         labels = []
-        for tracker_id, team_id, crop in zip(players.tracker_id, players_team_id, player_crops):
-            # Preprocess the crop to improve OCR accuracy
+        for tracker_id, team_id, crop in zip(players.tracker_id, players_team_id, crops):
             gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            # Apply thresholding to isolate the numbers
             _, thresh_crop = cv2.threshold(
                 gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
             )
-
-            # Use OCR to read the jersey number
             jersey_number = pytesseract.image_to_string(
                 thresh_crop,
                 config='--psm 7 -c tessedit_char_whitelist=0123456789'
             ).strip()
 
-            # Update jersey_numbers_history
             counts = jersey_numbers_history[tracker_id]
             counts[jersey_number] += 1
 
-            # Check if any jersey number has reached the threshold
             for number, count in counts.items():
                 if count >= JERSEY_NUMBER_THRESHOLD and number.isdigit():
-                    # Check if the jersey number is already assigned to another player in the same team
                     team_numbers = assigned_jersey_numbers[team_id]
                     if number not in team_numbers.values():
                         assigned_jersey_numbers[team_id][tracker_id] = number
-                        break  # Exit loop once the jersey number is confirmed
+                        break
 
-            # Build label
             if tracker_id in assigned_jersey_numbers[team_id]:
                 label = assigned_jersey_numbers[team_id][tracker_id]
             else:
-                label = ""  # No jersey number assigned yet
-
+                label = ''
             labels.append(label)
 
+        # Transform player positions into pitch coordinates
+        transformed_players_positions = transformer.transform_points(
+            players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+        ) / 100.0
+
+        # Estimate speed for each player
+        for tracker_id, position, bbox in zip(
+            players.tracker_id, transformed_players_positions, players.xyxy
+        ):
+            position_history[tracker_id].append(position)
+            if len(position_history[tracker_id]) > 10:  # keep last 10 positions
+                position_history[tracker_id].pop(0)
+
+            speed = estimate_speed(position_history[tracker_id], frame_rate)
+            # Annotate speed on the frame
+            if tracker_id is not None:
+                x, y = int(bbox[0]), int(bbox[1])
+                cv2.putText(
+                    frame,
+                    f'{speed:.2f} m/s',
+                    (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 0),
+                    1
+                )
+
+        # ------------------- Goalkeepers & Referees -------------------
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
-            players, players_team_id, goalkeepers)
-
+            players, players_team_id, goalkeepers
+        )
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
+        # ------------------- Ball Detection & Tracking -------------------
         ball_result = ball_detection_model(frame, imgsz=640, verbose=False)[0]
         ball_detections = sv.Detections.from_ultralytics(ball_result)
         ball_class_id = 1
         ball_detections = ball_detections[ball_detections.class_id == ball_class_id]
-
         ball_detections = ball_tracker.update(ball_detections)
 
         if len(ball_detections) == 0:
@@ -581,10 +681,10 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
             last_ball_detections = ball_detections
             ball_missing_frames = 0
 
-        # Assign dummy tracker_id to ball_detections if they don't have any
         if ball_detections.tracker_id is None:
             ball_detections.tracker_id = np.arange(len(ball_detections))
 
+        # Merge all detections for final annotation
         detections = sv.Detections.merge([players, goalkeepers, referees, ball_detections])
         color_lookup = np.array(
             players_team_id.tolist() +
@@ -592,50 +692,142 @@ def run_radar(source_video_path: str, device: str, json_file_path: str) -> Itera
             [REFEREE_CLASS_ID] * len(referees) +
             [BALL_COLOR_ID] * len(ball_detections)
         )
-        # Build full labels for annotation
-        labels = labels + [""] * (len(goalkeepers) + len(referees) + len(ball_detections))
+        labels = labels + [''] * (len(goalkeepers) + len(referees) + len(ball_detections))
 
-        # Apply homography transformation to player, goalkeeper, and referee positions
-        transformed_players_positions = transformer.transform_points(players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)) / 100  # Convert cm to m
-        transformed_goalkeepers_positions = transformer.transform_points(goalkeepers.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)) / 100  # Convert cm to m
-        transformed_referees_positions = transformer.transform_points(referees.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)) / 100  # Convert cm to m
+        transformed_goalkeepers_positions = transformer.transform_points(
+            goalkeepers.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+        ) / 100.0
+        transformed_referees_positions = transformer.transform_points(
+            referees.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+        ) / 100.0
 
+        # ------------------- Ball Position in Pitch Coordinates -------------------
         transformed_ball_positions = transformer.transform_points(
-            ball_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER))
-        # Save transformed (and scaled) positions to JSON
-        frame_data = {
-            'frame_index': frame_index,
-            'players': [{'id': int(tracker_id), 'team_id': int(team_id), 'position': list(pos), 'jersey_number': assigned_jersey_numbers[team_id].get(tracker_id, None)}
-                        for tracker_id, team_id, pos in zip(players.tracker_id, players_team_id, transformed_players_positions)],
-            'goalkeepers': [{'id': int(tracker_id), 'team_id': int(team_id), 'position': list(pos), 'jersey_number': '1'}
-                            for tracker_id, team_id, pos in zip(goalkeepers.tracker_id, goalkeepers_team_id, transformed_goalkeepers_positions)],
-            'referees': [{'position': list(pos)} for pos in transformed_referees_positions],
-            'balls': [{'position': list(pos)} for pos in transformed_ball_positions / 100]  # Convert cm to m
-        }
+            ball_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+        )  # not scaled by /100 so you can decide how you measure closeness
 
-        all_frames.append(frame_data)
+        # ------------------- Who has the ball this frame? -------------------
+        # We'll only consider if we see exactly one ball (common scenario).
+        global total_frames, possession_counts
+        current_ball_possession_team = None
 
+        if len(transformed_ball_positions) == 1 and len(transformed_players_positions) > 0:
+            ball_pos = transformed_ball_positions[0]
+            min_dist = float('inf')
+            closest_player_team_id = None
+
+            # Find the closest player in pitch space
+            for pos, t_id in zip(transformed_players_positions, players_team_id):
+                dist = euclidean_distance(ball_pos, pos)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_player_team_id = t_id
+
+            # Increase possession counter for the closest player's team
+            if closest_player_team_id is not None:
+                possession_counts[closest_player_team_id] += 1
+                current_ball_possession_team = closest_player_team_id
+
+        total_frames += 1
+
+        # ------------------- Logging possession text -------------------
+        # By user request: 'team A has it' or 'team B has it'
+        if current_ball_possession_team == TEAM_A_ID:
+            cv2.putText(
+                frame,
+                'team A has it',
+                (50, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (255, 255, 255),
+                2
+            )
+        elif current_ball_possession_team == TEAM_B_ID:
+            cv2.putText(
+                frame,
+                'team B has it',
+                (50, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (255, 255, 255),
+                2
+            )
+
+        # ------------------- Calculate possession % for overlay -------------------
+        pos_a_percent = 0.0
+        pos_b_percent = 0.0
+        if total_frames > 0:
+            pos_a_percent = (possession_counts[TEAM_A_ID] / total_frames) * 100.0
+            pos_b_percent = (possession_counts[TEAM_B_ID] / total_frames) * 100.0
+
+        # Show in top-left corner, below "team A has it" / "team B has it"
+        cv2.putText(
+            frame,
+            f'Team A: {pos_a_percent:.1f}% - Team B: {pos_b_percent:.1f}%',
+            (50, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2
+        )
+
+        # ------------------- Annotate Frame -------------------
         annotated_frame = frame.copy()
         annotated_frame = ELLIPSE_ANNOTATOR.annotate(
-            annotated_frame, detections, custom_color_lookup=color_lookup)
+            annotated_frame, detections, custom_color_lookup=color_lookup
+        )
         annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
             annotated_frame, detections, labels,
-            custom_color_lookup=color_lookup)
-
-        h, w, _ = frame.shape
-        radar = render_radar(detections, keypoints, color_lookup, labels)
-        radar = sv.resize_image(radar, (w // 2, h // 2))
-        radar_h, radar_w, _ = radar.shape
-        rect = sv.Rect(
-            x=w // 2 - radar_w // 2,
-            y=h - radar_h,
-            width=radar_w,
-            height=radar_h
+            custom_color_lookup=color_lookup
         )
-        annotated_frame = sv.draw_image(annotated_frame, radar, opacity=0.5, rect=rect)
+
+        # Use the helper function to add the radar overlay
+        annotated_frame = create_radar_frame(
+            annotated_frame, detections, color_lookup, labels, keypoints
+        )
+
+        # Save data for JSON
+        frame_data = {
+            'frame_index': frame_index,
+            'players': [
+                {
+                    'id': int(tracker_id),
+                    'team_id': int(team_id),
+                    'position': list(pos),
+                    'jersey_number': assigned_jersey_numbers[team_id].get(tracker_id, None)
+                }
+                for tracker_id, team_id, pos in zip(
+                    players.tracker_id, players_team_id, transformed_players_positions
+                )
+            ],
+            'goalkeepers': [
+                {
+                    'id': int(tracker_id),
+                    'team_id': int(team_id),
+                    'position': list(pos),
+                    'jersey_number': '1'
+                }
+                for tracker_id, team_id, pos in zip(
+                    goalkeepers.tracker_id,
+                    goalkeepers_team_id,
+                    transformed_goalkeepers_positions
+                )
+            ],
+            'referees': [
+                {'position': list(pos)}
+                for pos in transformed_referees_positions
+            ],
+            'balls': [
+                {'position': list(pos)}
+                for pos in (transformed_ball_positions / 100.0)  # scale if you wish
+            ]
+        }
+        all_frames.append(frame_data)
 
         frame_index += 1
         yield annotated_frame
+
+    # Finally, save everything to JSON
     save_all_frames_to_json(json_file_path)
 
 
